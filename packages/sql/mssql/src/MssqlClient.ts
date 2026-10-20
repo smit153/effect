@@ -350,10 +350,19 @@ export const make = (
       })
 
       const ended = Deferred.makeUnsafe<void>()
+      // Settles when the latest cancelled request does. Cancelling is
+      // asynchronous, and tedious takes no new request until it has settled.
+      let cancelled: Deferred.Deferred<void> | undefined
+      const settleCancelled = () => {
+        if (cancelled !== undefined) Deferred.doneUnsafe(cancelled, Effect.void)
+      }
+      // Requests wait for a cancelled one to settle, or for the connection to end.
+      const awaitCancelled = Effect.suspend(() => cancelled === undefined ? Effect.void : Deferred.await(cancelled))
       let closing = false
       let endEmitted = false
       const onError = () => {
         Deferred.doneUnsafe(ended, Effect.void)
+        settleCancelled()
       }
       const removeListeners = () => {
         // Tedious can emit a queued error after end, even once pool cleanup
@@ -363,6 +372,7 @@ export const make = (
       const onEnd = () => {
         endEmitted = true
         Deferred.doneUnsafe(ended, Effect.void)
+        settleCancelled()
         if (closing) removeListeners()
       }
 
@@ -390,97 +400,118 @@ export const make = (
         })
       })
 
+      // Interruption cancels the request, and the connection's next request
+      // waits for it to settle.
+      const cancelOnInterrupt = (settled: Deferred.Deferred<void>) =>
+        Effect.sync(() => {
+          cancelled = settled
+          if (Deferred.isDoneUnsafe(ended)) Deferred.doneUnsafe(settled, Effect.void)
+          conn.cancel()
+        })
+
       const run = (
         sql: string,
         values?: ReadonlyArray<any>,
         rowsAsArray = false
       ) =>
-        Effect.callback<any, SqlError>((resume) => {
-          const req = new Tedious.Request(sql, (cause, _rowCount, result) => {
-            if (cause) {
-              resume(
-                Effect.fail(new SqlError({ reason: classifyError(cause, "Failed to execute statement", "execute") }))
-              )
-              return
-            }
+        Effect.andThen(
+          awaitCancelled,
+          Effect.callback<any, SqlError>((resume) => {
+            const settled = Deferred.makeUnsafe<void>()
+            const req = new Tedious.Request(sql, (cause, _rowCount, result) => {
+              Deferred.doneUnsafe(settled, Effect.void)
+              if (cause) {
+                resume(
+                  Effect.fail(new SqlError({ reason: classifyError(cause, "Failed to execute statement", "execute") }))
+                )
+                return
+              }
 
-            if (rowsAsArray) {
-              result = result.map((row: any) => row.map((_: any) => _.value))
-            } else {
-              result = rowsToObjects(result)
-            }
-
-            resume(Effect.succeed(result))
-          })
-
-          if (values) {
-            for (let i = 0, len = values.length; i < len; i++) {
-              const value = values[i]
-              const name = numberToParamName(i)
-
-              if (isMssqlParam(value)) {
-                req.addParameter(name, value.paramA, value.paramB, value.paramC)
+              if (rowsAsArray) {
+                result = result.map((row: any) => row.map((_: any) => _.value))
               } else {
-                const kind = Statement.primitiveKind(value)
-                const type = parameterTypes[kind]
-                req.addParameter(name, type, value)
+                result = rowsToObjects(result)
+              }
+
+              resume(Effect.succeed(result))
+            })
+
+            if (values) {
+              for (let i = 0, len = values.length; i < len; i++) {
+                const value = values[i]
+                const name = numberToParamName(i)
+
+                if (isMssqlParam(value)) {
+                  req.addParameter(name, value.paramA, value.paramB, value.paramC)
+                } else {
+                  const kind = Statement.primitiveKind(value)
+                  const type = parameterTypes[kind]
+                  req.addParameter(name, type, value)
+                }
               }
             }
-          }
 
-          conn.cancel()
-          conn.execSql(req)
-          return Effect.sync(() => conn.cancel())
-        })
+            conn.cancel()
+            conn.execSql(req)
+            return cancelOnInterrupt(settled)
+          })
+        )
 
       const runProcedure = (
         procedure: Procedure.ProcedureWithValues<any, any, any>,
         transformRows: ((rows: ReadonlyArray<any>) => ReadonlyArray<any>) | undefined
       ) =>
-        Effect.callback<any, SqlError>((resume) => {
-          const result: Record<string, any> = {}
+        Effect.andThen(
+          awaitCancelled,
+          Effect.callback<any, SqlError>((resume) => {
+            const result: Record<string, any> = {}
+            const settled = Deferred.makeUnsafe<void>()
 
-          const req = new Tedious.Request(
-            escape(procedure.name),
-            (cause, _, rows) => {
-              if (cause) {
-                resume(
-                  Effect.fail(new SqlError({ reason: classifyError(cause, "Failed to execute statement", "execute") }))
-                )
-              } else {
-                rows = rowsToObjects(rows)
-                if (transformRows) {
-                  rows = transformRows(rows) as any
+            const req = new Tedious.Request(
+              escape(procedure.name),
+              (cause, _, rows) => {
+                Deferred.doneUnsafe(settled, Effect.void)
+                if (cause) {
+                  resume(
+                    Effect.fail(
+                      new SqlError({ reason: classifyError(cause, "Failed to execute statement", "execute") })
+                    )
+                  )
+                } else {
+                  rows = rowsToObjects(rows)
+                  if (transformRows) {
+                    rows = transformRows(rows) as any
+                  }
+                  resume(
+                    Effect.succeed({
+                      output: result,
+                      rows
+                    })
+                  )
                 }
-                resume(
-                  Effect.succeed({
-                    output: result,
-                    rows
-                  })
-                )
               }
+            )
+
+            for (const name in procedure.params) {
+              const param = procedure.params[name]
+              const value = procedure.values[name]
+              req.addParameter(name, param.type, value, param.options)
             }
-          )
 
-          for (const name in procedure.params) {
-            const param = procedure.params[name]
-            const value = procedure.values[name]
-            req.addParameter(name, param.type, value, param.options)
-          }
+            for (const name in procedure.outputParams) {
+              const param = procedure.outputParams[name]
+              req.addOutputParameter(name, param.type, undefined, param.options)
+            }
 
-          for (const name in procedure.outputParams) {
-            const param = procedure.outputParams[name]
-            req.addOutputParameter(name, param.type, undefined, param.options)
-          }
+            req.on("returnValue", (name, value) => {
+              Rec.assignProperty(result, name, value)
+            })
 
-          req.on("returnValue", (name, value) => {
-            Rec.assignProperty(result, name, value)
+            conn.cancel()
+            conn.callProcedure(req)
+            return cancelOnInterrupt(settled)
           })
-
-          conn.cancel()
-          conn.callProcedure(req)
-          return Effect.sync(() => conn.cancel())
-        })
+        )
 
       const connection = identity<MssqlConnection>({
         execute(sql, params, transformRows) {
@@ -506,66 +537,78 @@ export const make = (
         call(procedure, transformRows) {
           return runProcedure(procedure, transformRows)
         },
-        begin: Effect.callback<void, SqlError>((resume) => {
-          conn.beginTransaction((cause) => {
-            if (cause) {
-              resume(
-                Effect.fail(
-                  new SqlError({
-                    reason: classifyError(cause, "Failed to begin transaction", "beginTransaction")
-                  })
-                )
-              )
-            } else {
-              resume(Effect.void)
-            }
-          })
-        }),
-        commit: Effect.callback<void, SqlError>((resume) => {
-          conn.commitTransaction((cause) => {
-            if (cause) {
-              resume(
-                Effect.fail(
-                  new SqlError({
-                    reason: classifyError(cause, "Failed to commit transaction", "commitTransaction")
-                  })
-                )
-              )
-            } else {
-              resume(Effect.void)
-            }
-          })
-        }),
-        savepoint: (name: string) =>
+        begin: Effect.andThen(
+          awaitCancelled,
           Effect.callback<void, SqlError>((resume) => {
-            conn.saveTransaction((cause) => {
-              if (cause) {
-                resume(
-                  Effect.fail(
-                    new SqlError({ reason: classifyError(cause, "Failed to create savepoint", "createSavepoint") })
-                  )
-                )
-              } else {
-                resume(Effect.void)
-              }
-            }, name)
-          }),
-        rollback: (name?: string) =>
-          Effect.callback<void, SqlError>((resume) => {
-            conn.rollbackTransaction((cause) => {
+            conn.beginTransaction((cause) => {
               if (cause) {
                 resume(
                   Effect.fail(
                     new SqlError({
-                      reason: classifyError(cause, "Failed to rollback transaction", "rollbackTransaction")
+                      reason: classifyError(cause, "Failed to begin transaction", "beginTransaction")
                     })
                   )
                 )
               } else {
                 resume(Effect.void)
               }
-            }, name)
+            })
           })
+        ),
+        commit: Effect.andThen(
+          awaitCancelled,
+          Effect.callback<void, SqlError>((resume) => {
+            conn.commitTransaction((cause) => {
+              if (cause) {
+                resume(
+                  Effect.fail(
+                    new SqlError({
+                      reason: classifyError(cause, "Failed to commit transaction", "commitTransaction")
+                    })
+                  )
+                )
+              } else {
+                resume(Effect.void)
+              }
+            })
+          })
+        ),
+        savepoint: (name: string) =>
+          Effect.andThen(
+            awaitCancelled,
+            Effect.callback<void, SqlError>((resume) => {
+              conn.saveTransaction((cause) => {
+                if (cause) {
+                  resume(
+                    Effect.fail(
+                      new SqlError({ reason: classifyError(cause, "Failed to create savepoint", "createSavepoint") })
+                    )
+                  )
+                } else {
+                  resume(Effect.void)
+                }
+              }, name)
+            })
+          ),
+        rollback: (name?: string) =>
+          Effect.andThen(
+            awaitCancelled,
+            Effect.callback<void, SqlError>((resume) => {
+              conn.rollbackTransaction((cause) => {
+                if (cause) {
+                  resume(
+                    Effect.fail(
+                      new SqlError({
+                        reason: classifyError(cause, "Failed to rollback transaction", "rollbackTransaction")
+                      })
+                    )
+                  )
+                } else {
+                  resume(Effect.void)
+                }
+              }, name)
+            })
+          )
       })
 
       connectionEnded.set(connection, ended)
