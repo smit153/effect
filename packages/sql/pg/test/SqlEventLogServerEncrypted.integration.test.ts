@@ -1,4 +1,5 @@
 import { Layer } from "effect"
+import * as CompactionTest from "effect-test/eventlog/EventLogServerEncryptedCompactionTest"
 import * as EncryptedTest from "effect-test/eventlog/EventLogServerEncryptedTest"
 import * as SqlEventLogServerEncryptedStorageTest from "effect-test/eventlog/SqlEventLogServerEncryptedStorageTest"
 import * as EventLogEncryption from "effect/eventlog/EventLogEncryption"
@@ -14,3 +15,11 @@ EncryptedTest.suite(
 )
 
 SqlEventLogServerEncryptedStorageTest.suite("pg", PgContainer.layerClient)
+
+CompactionTest.suite(
+  "pg",
+  (options) => SqlEventLogServerEncrypted.layerStorage(options).pipe(Layer.provide(EventLogEncryption.layerSubtle)),
+  PgContainer.layerClient
+)
+
+SqlEventLogServerEncryptedStorageTest.compactionSuite("pg", PgContainer.layerClient)
